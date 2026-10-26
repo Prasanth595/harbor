@@ -15,7 +15,10 @@
 package health
 
 import (
+	"runtime"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/docker/distribution/health"
 	"github.com/stretchr/testify/assert"
@@ -48,4 +51,28 @@ func TestCheckHealth(t *testing.T) {
 	registry["component02"] = fakeHealthChecker(false)
 	status = ctl.GetHealth(nil)
 	assert.Equal(t, "unhealthy", status.Status)
+}
+
+func TestCheckTimeoutDoesNotLeakGoroutine(t *testing.T) {
+	unblock := make(chan struct{})
+	exited := make(chan struct{})
+	checker := health.CheckFunc(func() error {
+		defer close(exited)
+		<-unblock
+		return nil
+	})
+
+	c := make(chan *ComponentHealthStatus, 1)
+	check("slow", checker, 10*time.Millisecond, c)
+	status := <-c
+	assert.Equal(t, "unhealthy", status.Status)
+	assert.Contains(t, status.Error, "timeout")
+
+	close(unblock)
+	<-exited
+	// The goroutine must finish its send once the checker returns, not block forever.
+	assert.Eventually(t, func() bool {
+		buf := make([]byte, 1<<20)
+		return !strings.Contains(string(buf[:runtime.Stack(buf, true)]), "controller/health.check.func1")
+	}, 2*time.Second, 10*time.Millisecond)
 }
